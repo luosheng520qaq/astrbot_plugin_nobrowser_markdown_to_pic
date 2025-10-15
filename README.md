@@ -53,10 +53,10 @@
 
 ## 更新日志
 
-### v2.0.0
-- 重构为 pillowmd 渲染，移除浏览器依赖
-- 新增 `style_path` 配置项，支持本地样式目录
-- 保留 `md2img` 指令和 LLM 自动转图逻辑
+### v1.0.0
+- 构建为 pillowmd 渲染，移除浏览器依赖
+- 使用 `style_path` 配置项，支持本地样式目录
+- 使用 `md2img` 指令和 LLM 自动转图逻辑
 
 ## 特别鸣谢
 - pillowmd 项目文档：https://github.com/Monody-S/CustomMarkdownImage
