@@ -1,0 +1,14 @@
+{
+    "style_path": {
+        "description": "pillowmd样式目录路径（本地），留空则使用默认样式",
+        "type": "string",
+        "hint": "例如 C:\\styles\\my-style 或 /data/styles/default",
+        "default": ""
+    },
+    "md2img_len_limit": {
+        "description": "LLM输出长度超过该值时自动转图（<=0禁用）",
+        "type": "int",
+        "hint": "",
+        "default": 100
+    }
+}

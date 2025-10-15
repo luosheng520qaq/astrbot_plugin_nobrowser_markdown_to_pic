@@ -1,0 +1,5 @@
+name: astrbot_plugin_nobrowser_markdown_to_pic # 这是你的插件的唯一识别名。
+desc: 无浏览器Markdown转图片，基于pillowmd实现，支持指令和LLM自动转换 # 插件简短描述
+version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: Xican # 作者
+repo: https://github.com/luosheng520qaq/astrbot_plugin_nobrowser_markdown_to_pic # 插件的仓库地址
