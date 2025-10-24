@@ -21,9 +21,25 @@ class MyPlugin(Star):
         super().__init__(context)
 
         self.style_path = config.get("style_path", "").strip()
+        self.auto_convert_mode = config.get("auto_convert_mode", "length")
         self.md2img_len_limit = config.get("md2img_len_limit", 100)
+        self.regex_pattern = config.get("regex_pattern", r"```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^#{1,6}\s+.+$|^>\s+.+$|^\s*[-*+]\s+.+$|^\s*\d+\.\s+.+$|\|[^\n]*\||\[.+?\]\(.+?\)|!\[.*?\]\(.+?\)|^\s*---+\s*$|^\s*\*\*\*+\s*$")
+        self.extract_links_and_code = config.get("extract_links_and_code", False)
+        self.extract_links = config.get("extract_links", True)
+        self.extract_code_blocks = config.get("extract_code_blocks", True)
+        self.extract_inline_code = config.get("extract_inline_code", False)
 
         self._style = None
+        self._compiled_regex = None
+        
+        # 编译正则表达式
+        if self.auto_convert_mode == "regex" and self.regex_pattern:
+            try:
+                # 使用 MULTILINE 和 DOTALL 标志以正确处理多行文本
+                self._compiled_regex = re.compile(self.regex_pattern, re.DOTALL | re.MULTILINE)
+            except re.error as e:
+                logger.error(f"正则表达式编译失败: {e}")
+                self._compiled_regex = None
 
     async def initialize(self):
         """插件初始化：加载 pillowmd 样式或使用默认样式"""
@@ -51,6 +67,96 @@ class MyPlugin(Star):
             else:
                 logger.warning(f"样式路径不存在: {self.style_path}，将使用默认样式")
                 self._style = None
+
+    def _should_convert_to_image(self, text: str) -> bool:
+        """判断是否应该转换为图片"""
+        if self.auto_convert_mode == "disabled":
+            return False
+        elif self.auto_convert_mode == "length":
+            return len(text) > self.md2img_len_limit and self.md2img_len_limit > 0
+        elif self.auto_convert_mode == "regex":
+            if self._compiled_regex is None:
+                return False
+            return bool(self._compiled_regex.search(text))
+        return False
+
+    def _extract_content_elements(self, text: str) -> dict:
+        """提取文本中的链接和代码块"""
+        if not self.extract_links_and_code:
+            return {}
+        
+        extracted = {}
+        
+        # 提取链接
+        if self.extract_links:
+            # Markdown链接格式: [text](url) 和 直接链接 http(s)://...
+            link_patterns = [
+                r'\[([^\]]+)\]\(([^)]+)\)',  # [text](url)
+                r'(?<![\[\(])(https?://[^\s\)]+)',  # 直接链接
+            ]
+            links = []
+            for pattern in link_patterns:
+                matches = re.finditer(pattern, text)
+                for match in matches:
+                    if len(match.groups()) == 2:  # [text](url)
+                        links.append(f"{match.group(1)}: {match.group(2)}")
+                    else:  # 直接链接
+                        links.append(match.group(1))
+            if links:
+                extracted['links'] = links
+
+        # 提取代码块
+        if self.extract_code_blocks:
+            code_block_pattern = r'```(?:(\w+)\n)?([\s\S]*?)```'
+            code_blocks = []
+            matches = re.finditer(code_block_pattern, text)
+            for match in matches:
+                lang = match.group(1) or "text"
+                code = match.group(2).strip()
+                if code:
+                    code_blocks.append(f"```{lang}\n{code}\n```")
+            if code_blocks:
+                extracted['code_blocks'] = code_blocks
+
+        # 提取行内代码
+        if self.extract_inline_code:
+            inline_code_pattern = r'`([^`\n]+)`'
+            inline_codes = re.findall(inline_code_pattern, text)
+            if inline_codes:
+                extracted['inline_codes'] = [f"`{code}`" for code in inline_codes]
+
+        return extracted
+
+    async def _send_extracted_content(self, extracted: dict, event: AstrMessageEvent):
+        """发送提取的内容"""
+        if not extracted:
+            return
+
+        content_parts = []
+        
+        if 'links' in extracted:
+            content_parts.append("🔗 链接:")
+            for link in extracted['links']:
+                content_parts.append(f"  {link}")
+        
+        if 'code_blocks' in extracted:
+            if content_parts:
+                content_parts.append("")
+            content_parts.append("📝 代码块:")
+            for i, code_block in enumerate(extracted['code_blocks'], 1):
+                content_parts.append(f"代码块 {i}:")
+                content_parts.append(code_block)
+                content_parts.append("")
+        
+        if 'inline_codes' in extracted:
+            if content_parts:
+                content_parts.append("")
+            content_parts.append("💻 行内代码:")
+            content_parts.append(" ".join(extracted['inline_codes']))
+
+        if content_parts:
+            message = "\n".join(content_parts)
+            await event.send(MessageChain().message(message=message))
 
     def _clean_markdown_text(self, text: str) -> str:
         """清理Markdown文本，使代码块更规范并去除多余空行"""
@@ -116,6 +222,11 @@ class MyPlugin(Star):
 
             if is_llm_response:
                 await event.send(MessageChain().file_image(path=image_path))
+                
+                # 如果开启了内容提取，发送提取的内容
+                if self.extract_links_and_code:
+                    extracted = self._extract_content_elements(text)
+                    await self._send_extracted_content(extracted, event)
             else:
                 yield event.image_result(image_path)
 
@@ -155,9 +266,11 @@ class MyPlugin(Star):
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """LLM响应后超出阈值自动转图"""
+        """LLM响应后根据配置的模式判断是否自动转图"""
         rawtext = resp.result_chain.chain[0].text
-        if len(rawtext) > self.md2img_len_limit and self.md2img_len_limit > 0:
+        logger.info(f"LLM原始响应内容: {rawtext}")
+        if self._should_convert_to_image(rawtext):
+            logger.info("检测到相关内容内容，开始转图...")
             try:
                 async for _ in self._generate_and_send_image(rawtext, event, True):
                     pass
@@ -166,6 +279,5 @@ class MyPlugin(Star):
                 logger.error(f"处理失败: {str(e)}")
                 msg_chain = MessageChain().message(message=f"处理失败: {str(e)}")
                 await event.send(msg_chain)
-                
         else:
             pass

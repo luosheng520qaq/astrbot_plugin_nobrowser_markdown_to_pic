@@ -5,10 +5,47 @@
         "hint": "例如 C:\\styles\\my-style 或 /data/styles/default",
         "default": ""
     },
+    "auto_convert_mode": {
+        "description": "自动转图模式",
+        "type": "string",
+        "options": ["disabled", "length", "regex"],
+        "hint": "disabled: 禁用自动转图; length: 按长度判断; regex: 按正则表达式判断",
+        "default": "length"
+    },
     "md2img_len_limit": {
-        "description": "LLM输出长度超过该值时自动转图（<=0禁用）",
+        "description": "长度模式：LLM输出超过该值时自动转图",
         "type": "int",
-        "hint": "",
+        "hint": "仅在auto_convert_mode为length时生效",
         "default": 100
+    },
+    "regex_pattern": {
+        "description": "正则模式：匹配该正则表达式的内容将自动转图",
+        "type": "text",
+        "hint": "仅在auto_convert_mode为regex时生效，默认匹配常见Markdown和LaTeX语法",
+        "default": "```[\\s\\S]*?```|\\$\\$[\\s\\S]*?\\$\\$|\\$[^$\n]+\\$|^#{1,6}\\s+.+$|^>\\s+.+$|^\\s*[-*+]\\s+.+$|^\\s*\\d+\\.\\s+.+$|\\|[^\\n]*\\||\\[.+?\\]\\(.+?\\)|!\\[.*?\\]\\(.+?\\)|^\\s*---+\\s*$|^\\s*\\*\\*\\*+\\s*$"
+    },
+    "extract_links_and_code": {
+        "description": "是否在转图后单独发送链接和代码块",
+        "type": "bool",
+        "hint": "开启后会解析LLM输出中的链接和代码块，在发送图片后单独发送文本便于复制",
+        "default": false
+    },
+    "extract_links": {
+        "description": "提取链接",
+        "type": "bool",
+        "hint": "是否提取并单独发送链接（需要extract_links_and_code开启）",
+        "default": true
+    },
+    "extract_code_blocks": {
+        "description": "提取代码块",
+        "type": "bool",
+        "hint": "是否提取并单独发送代码块（需要extract_links_and_code开启）",
+        "default": true
+    },
+    "extract_inline_code": {
+        "description": "提取行内代码",
+        "type": "bool",
+        "hint": "是否提取并单独发送行内代码（需要extract_links_and_code开启）",
+        "default": false
     }
 }
