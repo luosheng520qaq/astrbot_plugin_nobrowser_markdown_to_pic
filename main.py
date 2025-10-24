@@ -14,7 +14,7 @@ except Exception:
     pillowmd = None
 
 
-@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.0.0")
+@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.1.0")
 class MyPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
