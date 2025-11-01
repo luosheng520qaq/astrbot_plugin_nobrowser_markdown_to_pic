@@ -16,6 +16,12 @@
 - 插件部署到 AstrBot 后，使用指令：`/md2img [Markdown内容]`
 - 根据配置的自动转图模式，LLM 回复将自动转换为图片发送
 
+# 推荐！
+自定义安装样式后，打开对应文件夹的setting.json
+修改xSizeMax为1000
+fontSize修改为30
+
+
 ## 如何使用（pillowmd）
 - 自定义样式渲染：
   - `style = pillowmd.LoadMarkdownStyles(样式路径)`
