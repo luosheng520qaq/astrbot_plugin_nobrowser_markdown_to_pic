@@ -19,7 +19,7 @@
 # 推荐！
 自定义安装样式后，打开对应文件夹的setting.json
 修改xSizeMax为1000
-fontSize修改为30
+fontSize修改为27
 
 
 ## 如何使用（pillowmd）
