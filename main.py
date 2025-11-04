@@ -247,7 +247,7 @@ class MyPlugin(Star):
             else:
                 yield event.plain_result(error_msg)
 
-    @filter.command("md2img")
+    @filter.command("md2img",priority=-999)
     async def markdown_to_image(self, event: AstrMessageEvent):
         """Markdown转图片指令"""
         message_str = event.message_str
@@ -264,7 +264,7 @@ class MyPlugin(Star):
         """插件销毁：无浏览器，无需清理资源"""
         logger.info("正在销毁无浏览器Markdown渲染插件...")
 
-    @filter.on_llm_response()
+    @filter.on_llm_response(priority=-999)
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """LLM响应后根据配置的模式判断是否自动转图"""
         rawtext = resp.result_chain.chain[0].text
