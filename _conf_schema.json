@@ -12,6 +12,13 @@
         "hint": "disabled: 禁用自动转图; length: 按长度判断; regex: 按正则表达式判断",
         "default": "length"
     },
+    "intercept_mode": {
+        "description": "拦截模式",
+        "type": "string",
+        "options": ["pre_send", "llm"],
+        "hint": "pre_send: 拦截所有发送前消息; llm: 仅拦截LLM响应消息",
+        "default": "pre_send"
+    },
     "md2img_len_limit": {
         "description": "长度模式：LLM输出超过该值时自动转图",
         "type": "int",
@@ -47,5 +54,11 @@
         "type": "bool",
         "hint": "是否提取并单独发送行内代码（需要extract_links_and_code开启）",
         "default": false
+    },
+    "image_cache_ttl": {
+        "description": "图片缓存保留时间（秒）",
+        "type": "int",
+        "hint": "为避免并发误删，延迟清理临时图片，默认180秒",
+        "default": 180
     }
 }

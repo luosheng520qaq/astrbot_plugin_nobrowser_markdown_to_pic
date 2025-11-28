@@ -7,6 +7,8 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import LLMResponse
+from astrbot.api.message_components import Plain
+import astrbot.core.message.components as Comp
 
 try:
     import pillowmd
@@ -14,7 +16,7 @@ except Exception:
     pillowmd = None
 
 
-@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.1.0")
+@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.2.0")
 class MyPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -28,9 +30,13 @@ class MyPlugin(Star):
         self.extract_links = config.get("extract_links", True)
         self.extract_code_blocks = config.get("extract_code_blocks", True)
         self.extract_inline_code = config.get("extract_inline_code", False)
+        self.intercept_mode = config.get("intercept_mode", "pre_send")
 
         self._style = None
         self._compiled_regex = None
+        self._last_image_paths = []
+        self._image_paths_lock = asyncio.Lock()
+        self.image_cache_ttl = int(config.get("image_cache_ttl", 180))
         
         # 编译正则表达式
         if self.auto_convert_mode == "regex" and self.regex_pattern:
@@ -222,6 +228,16 @@ class MyPlugin(Star):
 
             if is_llm_response:
                 await event.send(MessageChain().file_image(path=image_path))
+                async def delayed_delete(p):
+                    await asyncio.sleep(self.image_cache_ttl)
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                asyncio.create_task(delayed_delete(image_path))
+                async with self._image_paths_lock:
+                    self._last_image_paths.append(image_path)
                 
                 # 如果开启了内容提取，发送提取的内容
                 if self.extract_links_and_code:
@@ -229,15 +245,16 @@ class MyPlugin(Star):
                     await self._send_extracted_content(extracted, event)
             else:
                 yield event.image_result(image_path)
-
-            async def delayed_delete(p):
-                await asyncio.sleep(10)
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-            asyncio.create_task(delayed_delete(image_path))
+                async def delayed_delete2(p):
+                    await asyncio.sleep(self.image_cache_ttl)
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                asyncio.create_task(delayed_delete2(image_path))
+                async with self._image_paths_lock:
+                    self._last_image_paths.append(image_path)
 
         except Exception as e:
             logger.error(f"处理失败: {str(e)}")
@@ -246,6 +263,45 @@ class MyPlugin(Star):
                 await event.send(MessageChain().message(message=error_msg))
             else:
                 yield event.plain_result(error_msg)
+
+    @filter.on_decorating_result(priority=-9999)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        if self.intercept_mode != "pre_send":
+            return
+        result = event.get_result()
+        chain = result.chain
+        new_chain = []
+        temp_paths = []
+
+        for comp in chain:
+            if isinstance(comp, Plain):
+                text = comp.text
+                if self._should_convert_to_image(text):
+                    try:
+                        img = await self._render_markdown_to_image(text)
+                        path = await self._save_temp_image(img)
+                        new_chain.append(Comp.Image.fromFileSystem(path))
+                        temp_paths.append(path)
+                        continue  # 已处理
+                    except Exception as e:
+                        logger.error(f"Markdown 转图片失败: {e}", exc_info=True)
+                        # 失败时回退到原始文本
+            new_chain.append(comp)
+
+        # 如果有任何转换发生，替换消息链
+        if temp_paths:
+            for p in temp_paths:
+                async def delayed_cleanup(px):
+                    await asyncio.sleep(self.image_cache_ttl)
+                    try:
+                        if os.path.exists(px):
+                            os.remove(px)
+                    except Exception:
+                        pass
+                asyncio.create_task(delayed_cleanup(p))
+            async with self._image_paths_lock:
+                self._last_image_paths.extend(temp_paths)
+            result.chain = new_chain
 
     @filter.command("md2img",priority=-999)
     async def markdown_to_image(self, event: AstrMessageEvent):
@@ -263,11 +319,26 @@ class MyPlugin(Star):
     async def terminate(self):
         """插件销毁：无浏览器，无需清理资源"""
         logger.info("正在销毁无浏览器Markdown渲染插件...")
+        try:
+            async with self._image_paths_lock:
+                for p in self._last_image_paths:
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                self._last_image_paths = []
+        except Exception:
+            pass
 
     @filter.on_llm_response(priority=-999)
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """LLM响应后根据配置的模式判断是否自动转图"""
-        rawtext = resp.result_chain.chain[0].text
+        if self.intercept_mode != "llm":
+            return
+        try:
+            rawtext = resp.result_chain.chain[0].text
+        except Exception:
+            return
         logger.info(f"LLM原始响应内容: {rawtext}")
         if self._should_convert_to_image(rawtext):
             logger.info("检测到相关内容内容，开始转图...")
@@ -279,5 +350,3 @@ class MyPlugin(Star):
                 logger.error(f"处理失败: {str(e)}")
                 msg_chain = MessageChain().message(message=f"处理失败: {str(e)}")
                 await event.send(msg_chain)
-        else:
-            pass
