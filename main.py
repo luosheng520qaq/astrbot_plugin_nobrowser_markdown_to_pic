@@ -37,7 +37,7 @@ class MyPlugin(Star):
         self._last_image_paths = []
         self._image_paths_lock = asyncio.Lock()
         self.image_cache_ttl = int(config.get("image_cache_ttl", 180))
-        
+
         # 编译正则表达式
         if self.auto_convert_mode == "regex" and self.regex_pattern:
             try:
@@ -90,9 +90,9 @@ class MyPlugin(Star):
         """提取文本中的链接和代码块"""
         if not self.extract_links_and_code:
             return {}
-        
+
         extracted = {}
-        
+
         # 提取链接
         if self.extract_links:
             # Markdown链接格式: [text](url) 和 直接链接 http(s)://...
@@ -139,12 +139,12 @@ class MyPlugin(Star):
             return
 
         content_parts = []
-        
+
         if 'links' in extracted:
             content_parts.append("🔗 链接:")
             for link in extracted['links']:
                 content_parts.append(f"  {link}")
-        
+
         if 'code_blocks' in extracted:
             if content_parts:
                 content_parts.append("")
@@ -153,7 +153,7 @@ class MyPlugin(Star):
                 content_parts.append(f"代码块 {i}:")
                 content_parts.append(code_block)
                 content_parts.append("")
-        
+
         if 'inline_codes' in extracted:
             if content_parts:
                 content_parts.append("")
@@ -167,9 +167,11 @@ class MyPlugin(Star):
     def _clean_markdown_text(self, text: str) -> str:
         """清理Markdown文本，使代码块更规范并去除多余空行"""
         pattern = r"(\s*)```(?:\s*\n?)([\s\S]*?)(?:\n?\s*)```(\s*)"
+
         def replace_match(match):
             content = match.group(2)
             return f"\n```\n{content}\n```\n"
+
         text = re.sub(pattern, replace_match, text, flags=re.DOTALL)
         return text.strip()
 
@@ -190,6 +192,7 @@ class MyPlugin(Star):
     async def _save_temp_image(self, img):
         """保存图片到临时文件，并返回路径"""
         loop = asyncio.get_running_loop()
+
         def save():
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 temp_path = f.name
@@ -218,43 +221,46 @@ class MyPlugin(Star):
                 except Exception:
                     raise
             return temp_path
+
         path = await loop.run_in_executor(None, save)
         return path
 
     async def _generate_and_send_image(self, text: str, event: AstrMessageEvent, is_llm_response: bool):
+        """
+        渲染并发送图片：
+        - is_llm_response=True 时，直接通过 event.send 发图片消息
+        - is_llm_response=False 时，通过 result 形式 yield 给上层
+        - 无论哪种情况，只要开启 extract_links_and_code，就会额外发送一条“链接/代码”消息
+        """
         try:
             img = await self._render_markdown_to_image(text)
             image_path = await self._save_temp_image(img)
 
+            # 发送图片
             if is_llm_response:
                 await event.send(MessageChain().file_image(path=image_path))
-                async def delayed_delete(p):
-                    await asyncio.sleep(self.image_cache_ttl)
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except Exception:
-                        pass
-                asyncio.create_task(delayed_delete(image_path))
-                async with self._image_paths_lock:
-                    self._last_image_paths.append(image_path)
-                
-                # 如果开启了内容提取，发送提取的内容
-                if self.extract_links_and_code:
-                    extracted = self._extract_content_elements(text)
-                    await self._send_extracted_content(extracted, event)
             else:
+                # 在指令 / 过滤器返回等场景，通过 result 形式返回
                 yield event.image_result(image_path)
-                async def delayed_delete2(p):
-                    await asyncio.sleep(self.image_cache_ttl)
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except Exception:
-                        pass
-                asyncio.create_task(delayed_delete2(image_path))
-                async with self._image_paths_lock:
-                    self._last_image_paths.append(image_path)
+
+            # 记录路径并异步删除
+            async with self._image_paths_lock:
+                self._last_image_paths.append(image_path)
+
+            async def delayed_delete(p):
+                await asyncio.sleep(self.image_cache_ttl)
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+            asyncio.create_task(delayed_delete(image_path))
+
+            # 无论是 LLM 响应还是普通指令，只要开启了提取，就单独发送链接 / 代码内容
+            if self.extract_links_and_code:
+                extracted = self._extract_content_elements(text)
+                await self._send_extracted_content(extracted, event)
 
         except Exception as e:
             logger.error(f"处理失败: {str(e)}")
@@ -282,6 +288,12 @@ class MyPlugin(Star):
                         path = await self._save_temp_image(img)
                         new_chain.append(Comp.Image.fromFileSystem(path))
                         temp_paths.append(path)
+
+                        # 在 pre_send 模式下也提取链接 / 代码并单独发送
+                        if self.extract_links_and_code:
+                            extracted = self._extract_content_elements(text)
+                            await self._send_extracted_content(extracted, event)
+
                         continue  # 已处理
                     except Exception as e:
                         logger.error(f"Markdown 转图片失败: {e}", exc_info=True)
@@ -298,12 +310,13 @@ class MyPlugin(Star):
                             os.remove(px)
                     except Exception:
                         pass
+
                 asyncio.create_task(delayed_cleanup(p))
             async with self._image_paths_lock:
                 self._last_image_paths.extend(temp_paths)
             result.chain = new_chain
 
-    @filter.command("md2img",priority=-999)
+    @filter.command("md2img", priority=-999)
     async def markdown_to_image(self, event: AstrMessageEvent):
         """Markdown转图片指令"""
         message_str = event.message_str
@@ -343,6 +356,8 @@ class MyPlugin(Star):
         if self._should_convert_to_image(rawtext):
             logger.info("检测到相关内容内容，开始转图...")
             try:
+                # 这里 _generate_and_send_image 在 is_llm_response=True 时不会 yield，
+                # async for 只是一种统一调用方式
                 async for _ in self._generate_and_send_image(rawtext, event, True):
                     pass
                 event.stop_event()
@@ -350,3 +365,4 @@ class MyPlugin(Star):
                 logger.error(f"处理失败: {str(e)}")
                 msg_chain = MessageChain().message(message=f"处理失败: {str(e)}")
                 await event.send(msg_chain)
+                # 这个代码在拦截所有消息的模式下无法处理文本中的代码块和链接的单独发送（已在上面修复）

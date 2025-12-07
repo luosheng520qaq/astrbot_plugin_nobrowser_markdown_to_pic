@@ -1,5 +1,5 @@
 name: astrbot_plugin_nobrowser_markdown_to_pic
 desc: 无浏览器Markdown转图片，基于pillowmd实现，支持指令和LLM自动转换 
-version: v1.2.0 
+version: v1.3.0 
 author: Xican 
 repo: https://github.com/luosheng520qaq/astrbot_plugin_nobrowser_markdown_to_pic 
