@@ -23,9 +23,13 @@ class MyPlugin(Star):
         super().__init__(context)
 
         self.style_path = config.get("style_path", "").strip()
+        # 新增 mix 模式支持：配置中已经有 "disabled" / "length" / "regex" / "mix"
         self.auto_convert_mode = config.get("auto_convert_mode", "length")
         self.md2img_len_limit = config.get("md2img_len_limit", 100)
-        self.regex_pattern = config.get("regex_pattern", r"```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^#{1,6}\s+.+$|^>\s+.+$|^\s*[-*+]\s+.+$|^\s*\d+\.\s+.+$|\|[^\n]*\||\[.+?\]\(.+?\)|!\[.*?\]\(.+?\)|^\s*---+\s*$|^\s*\*\*\*+\s*$")
+        self.regex_pattern = config.get(
+            "regex_pattern",
+            r"```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^#{1,6}\s+.+$|^>\s+.+$|^\s*[-*+]\s+.+$|^\s*\d+\.\s+.+$|\|[^\n]*\||\[.+?\]\(.+?\)|!\[.*?\]\(.+?\)|^\s*---+\s*$|^\s*\*\*\*+\s*$"
+        )
         self.extract_links_and_code = config.get("extract_links_and_code", False)
         self.extract_links = config.get("extract_links", True)
         self.extract_code_blocks = config.get("extract_code_blocks", True)
@@ -39,7 +43,8 @@ class MyPlugin(Star):
         self.image_cache_ttl = int(config.get("image_cache_ttl", 180))
 
         # 编译正则表达式
-        if self.auto_convert_mode == "regex" and self.regex_pattern:
+        # ✅ 这里改为：在 regex 和 mix 模式下都预编译正则
+        if self.auto_convert_mode in ("regex", "mix") and self.regex_pattern:
             try:
                 # 使用 MULTILINE 和 DOTALL 标志以正确处理多行文本
                 self._compiled_regex = re.compile(self.regex_pattern, re.DOTALL | re.MULTILINE)
@@ -75,15 +80,36 @@ class MyPlugin(Star):
                 self._style = None
 
     def _should_convert_to_image(self, text: str) -> bool:
-        """判断是否应该转换为图片"""
+        """
+        判断是否应该转换为图片
+
+        模式说明：
+        - disabled: 不转换
+        - length : 只按长度判断
+        - regex  : 只按正则判断
+        - mix    : 优先正则，如果不匹配再按长度判断
+        """
         if self.auto_convert_mode == "disabled":
             return False
-        elif self.auto_convert_mode == "length":
-            return len(text) > self.md2img_len_limit and self.md2img_len_limit > 0
-        elif self.auto_convert_mode == "regex":
+
+        text_len = len(text)
+        len_ok = self.md2img_len_limit > 0 and text_len > self.md2img_len_limit
+
+        if self.auto_convert_mode == "length":
+            return len_ok
+
+        if self.auto_convert_mode == "regex":
             if self._compiled_regex is None:
                 return False
             return bool(self._compiled_regex.search(text))
+
+        if self.auto_convert_mode == "mix":
+            # ✅ mix 模式：优先用正则判断，其次再按长度判断
+            if self._compiled_regex is not None and self._compiled_regex.search(text):
+                return True
+            return len_ok
+
+        # 兜底：未知模式一律不转换
         return False
 
     def _extract_content_elements(self, text: str) -> dict:
@@ -272,6 +298,12 @@ class MyPlugin(Star):
 
     @filter.on_decorating_result(priority=-9999)
     async def on_decorating_result(self, event: AstrMessageEvent):
+        """
+        pre_send 拦截模式：
+        - 会对即将发送的消息链进行遍历
+        - 对 Plain 文本按 _should_convert_to_image（已支持 mix）判断是否转图
+        - 如果转图成功，同时按配置发送“提取的链接/代码”
+        """
         if self.intercept_mode != "pre_send":
             return
         result = event.get_result()
@@ -346,6 +378,12 @@ class MyPlugin(Star):
 
     @filter.on_llm_response(priority=-999)
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
+        """
+        llm 拦截模式：
+        - 只针对 LLM 响应
+        - 根据 _should_convert_to_image（已支持 mix）判断是否转图
+        - 转图成功会阻止原始文本发送，只发图片（以及可选的链接/代码文本）
+        """
         if self.intercept_mode != "llm":
             return
         try:
@@ -365,4 +403,3 @@ class MyPlugin(Star):
                 logger.error(f"处理失败: {str(e)}")
                 msg_chain = MessageChain().message(message=f"处理失败: {str(e)}")
                 await event.send(msg_chain)
-                # 这个代码在拦截所有消息的模式下无法处理文本中的代码块和链接的单独发送（已在上面修复）

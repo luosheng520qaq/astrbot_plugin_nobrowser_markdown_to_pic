@@ -8,8 +8,8 @@
     "auto_convert_mode": {
         "description": "自动转图模式",
         "type": "string",
-        "options": ["disabled", "length", "regex"],
-        "hint": "disabled: 禁用自动转图; length: 按长度判断; regex: 按正则表达式判断",
+        "options": ["disabled", "length", "regex", "mix"],
+        "hint": "disabled: 禁用自动转图; length: 按长度判断; regex: 按正则表达式判断; mix: 同时启用长度与正则判断",
         "default": "length"
     },
     "intercept_mode": {
@@ -22,13 +22,13 @@
     "md2img_len_limit": {
         "description": "长度模式：LLM输出超过该值时自动转图",
         "type": "int",
-        "hint": "仅在auto_convert_mode为length时生效",
+        "hint": "仅在auto_convert_mode为length或mix时生效",
         "default": 100
     },
     "regex_pattern": {
         "description": "正则模式：匹配该正则表达式的内容将自动转图",
         "type": "text",
-        "hint": "仅在auto_convert_mode为regex时生效，默认匹配常见Markdown和LaTeX语法",
+        "hint": "仅在auto_convert_mode为regex或mix时生效，默认匹配常见Markdown和LaTeX语法",
         "default": "(```[^\\n]*\\n[\\s\\S]*?\\n```$)|(^\\$\\$[\\s\\S]*?\\$\\$$)|(\\$(?:\\\\.|[^\\n$])+\\$)|(^#{1,6}\\s+\\S.+$)|(^>\\s+\\S.+$)|(^\\s{0,3}(?:[-*+])\\s+\\S.+$)|(^\\s{0,3}\\d+\\.\\s+\\S.+$)|(^\\|[^\\n]*\\|[^\\n]*$)|(!\\[[^\\]]*\\]\\([^)]+\\)|\\[[^\\]]+\\]\\([^)]+\\))|(^\\s{0,3}(?:-{3,}|_{3,}|\\*{3,})\\s*$)"
     },
     "extract_links_and_code": {
