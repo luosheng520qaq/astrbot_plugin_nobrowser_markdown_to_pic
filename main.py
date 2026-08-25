@@ -622,41 +622,50 @@ class MyPlugin(Star):
         pattern = r'^' + re.escape('md2img')
         message_str = re.sub(pattern, '', message_str).strip()
 
-        # 1) file:路径 / 文件:路径 语法：读取允许目录内的本地文件
-        #    相对路径以当前会话 workspace 为根（对齐 AstrBot readfile 本地路径解析）
-        file_path = _extract_md2img_file_arg(message_str)
+        downloaded_attachment = None  # 记录 get_file() 下载的临时文件，用后清理
+        try:
+            # 1) file:路径 / 文件:路径 语法：读取允许目录内的本地文件
+            #    相对路径以当前会话 workspace 为根（对齐 AstrBot readfile 本地路径解析）
+            file_path = _extract_md2img_file_arg(message_str)
 
-        # 2) 消息附带 .md/.markdown/.txt 文件
-        if file_path is None:
-            file_comp = None
-            for comp in event.get_messages():
-                if not isinstance(comp, Comp.File):
-                    continue
-                comp_name = (comp.name or "").lower()
-                comp_path = Path(comp.file_ or "").suffix.lower() if comp.file_ else ""
-                if comp_name.endswith(_MD2IMG_ALLOWED_EXTS) or comp_path in _MD2IMG_ALLOWED_EXTS:
-                    file_comp = comp
-                    break
-            if file_comp is not None:
-                file_path = await file_comp.get_file()
-                if not file_path:
-                    yield event.plain_result("读取文件失败: cannot get file content")
+            # 2) 消息附带 .md/.markdown/.txt 文件
+            if file_path is None:
+                file_comp = None
+                for comp in event.get_messages():
+                    if not isinstance(comp, Comp.File):
+                        continue
+                    comp_name = (comp.name or "").lower()
+                    comp_path = Path(comp.file_ or "").suffix.lower() if comp.file_ else ""
+                    if comp_name.endswith(_MD2IMG_ALLOWED_EXTS) or comp_path in _MD2IMG_ALLOWED_EXTS:
+                        file_comp = comp
+                        break
+                if file_comp is not None:
+                    file_path = await file_comp.get_file()
+                    downloaded_attachment = file_path  # 标记为需要清理的下载文件
+                    if not file_path:
+                        yield event.plain_result("读取文件失败: cannot get file content")
+                        return
+
+            # 3) 命中 file:语法或文件附件时，读取文件内容替代消息文本
+            if file_path is not None:
+                try:
+                    message_str = await self._read_md2img_file(event, file_path)
+                except (OSError, ValueError) as e:
+                    yield event.plain_result(f"读取文件失败: {e}")
                     return
-
-        # 3) 命中 file:语法或文件附件时，读取文件内容替代消息文本
-        if file_path is not None:
-            try:
-                message_str = await self._read_md2img_file(event, file_path)
-            except (OSError, ValueError) as e:
-                yield event.plain_result(f"读取文件失败: {e}")
+            elif not message_str:
+                # 4) 原有行为：直接渲染消息文本
+                yield event.plain_result("请输入要转换的Markdown内容")
                 return
-        elif not message_str:
-            # 4) 原有行为：直接渲染消息文本
-            yield event.plain_result("请输入要转换的Markdown内容")
-            return
 
-        async for result in self._generate_and_send_image(message_str, event, False):
-            yield result
+            async for result in self._generate_and_send_image(message_str, event, False):
+                yield result
+        finally:
+            if downloaded_attachment:
+                try:
+                    os.unlink(downloaded_attachment)
+                except OSError:
+                    pass
 
     @filter.llm_tool(name="render_markdown_to_image")
     async def render_markdown_to_image(
