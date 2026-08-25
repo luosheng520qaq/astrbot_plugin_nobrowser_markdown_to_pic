@@ -658,6 +658,11 @@ class MyPlugin(Star):
         md = (markdown or "").strip()
         file_path = (file_path or "").strip()
         if file_path:
+            # 剥离开头的 "file:路径" / "文件:路径" 前缀（含中英文冒号、可选空白/引号），
+            # 与 md2img 指令的 _MD2IMG_FILE_ARG_RE 处理保持一致
+            file_arg_match = _MD2IMG_FILE_ARG_RE.match(file_path)
+            if file_arg_match:
+                file_path = file_arg_match.group(1).strip().strip('"\'')
             # 与 md2img 指令完全一致的权限模型：workspace 根 + 管理员校验
             try:
                 workspace_root = await self._resolve_workspace_root(event)

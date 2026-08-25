@@ -470,14 +470,39 @@ async def main() -> None:
         ev = FakeEvent("llm tool")
         await expect_tool_error(plugin, ev, "tool non-admin /etc", file_path="/etc/passwd")
 
-        # ---- 29. llm tool regression: markdown only (no file_path) ---------
+        # ---- 29. llm tool: file_path with file: prefix (absolute) ---------
+        print("== llm tool: file_path with file: prefix (absolute) ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_success(
+            plugin, ev, md_content, "tool file: prefix absolute", file_path=f"file:{note_md}"
+        )
+
+        # ---- 30. llm tool: file_path with file: prefix (relative) ---------
+        print("== llm tool: file_path with file: prefix (relative) ==")
+        ev = FakeEvent("llm tool", umo=ws_umo)
+        await expect_tool_success(
+            plugin, ev, md_content, "tool file: prefix relative", file_path="file:note.md"
+        )
+
+        # ---- 31. llm tool: file_path with 文件: prefix and quotes ---------
+        print("== llm tool: 文件: prefix with quotes ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_success(
+            plugin,
+            ev,
+            md_content,
+            "tool 文件: prefix quoted",
+            file_path=f'文件:"{note_md}"',
+        )
+
+        # ---- 32. llm tool regression: markdown only (no file_path) ---------
         print("== llm tool regression: markdown only ==")
         ev = FakeEvent("llm tool")
         await expect_tool_success(
             plugin, ev, "# 标题", "tool markdown only", markdown="# 标题"
         )
 
-        # ---- 30. llm tool regression: empty markdown and no file_path -----
+        # ---- 33. llm tool regression: empty markdown and no file_path -----
         print("== llm tool regression: empty markdown ==")
         ev = FakeEvent("llm tool")
         await expect_tool_error(
@@ -488,12 +513,12 @@ async def main() -> None:
             markdown="",
         )
 
-        # ---- 31. regression: plain text still rendered ----
+        # ---- 34. regression: plain text still rendered ----
         print("== regression: plain text ==")
         ev = FakeEvent("md2img # 标题")
         await expect_success(plugin, ev, "# 标题", "plain text")
 
-        # ---- 32. regression: empty message prompt ----
+        # ---- 35. regression: empty message prompt ----
         print("== regression: empty message ==")
         ev = FakeEvent("md2img")
         await run_handler(plugin, ev)
