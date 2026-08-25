@@ -18,6 +18,9 @@ Covers:
 6. Relative paths resolve against the current workspace root.
 7. utf-8 first / gbk fallback decoding.
 8. Existing plain-text rendering behavior is untouched.
+9. The llm tool render_markdown_to_image reads files via file_path with the
+   same permission model (admin unrestricted, non-admin restricted) and
+   keeps the markdown-only behavior unchanged.
 
 Run from the plugin directory:
     uv run python tests/test_md2img_file_reading.py
@@ -161,6 +164,73 @@ async def expect_rejected(plugin: MyPlugin, event: FakeEvent, label: str):
         f"results={event.results}",
     )
     check(f"{label}: no image was produced", len(images) == 0, f"images={images}")
+
+
+async def expect_tool_success(
+    plugin: MyPlugin,
+    event: FakeEvent,
+    expected_text: str,
+    label: str,
+    **kwargs,
+):
+    """Assert the llm tool rendered expected_text into a real image."""
+    captured = []
+    real_render = plugin._render_markdown_to_image
+
+    async def spy(text, render_opts=None):
+        captured.append(text)
+        return await real_render(text, render_opts)
+
+    plugin._render_markdown_to_image = spy
+    try:
+        result = await plugin.render_markdown_to_image(event, **kwargs)
+    finally:
+        plugin._render_markdown_to_image = real_render
+
+    check(
+        f"{label}: tool returned success",
+        result.get("status") == "success",
+        f"result={result}",
+    )
+    check(
+        f"{label}: file content entered the render pipeline",
+        captured == [expected_text],
+        f"captured={captured!r}",
+    )
+
+
+async def expect_tool_error(
+    plugin: MyPlugin,
+    event: FakeEvent,
+    label: str,
+    message_prefix: str = "读取文件失败",
+    **kwargs,
+):
+    """Assert the llm tool returned an error without rendering."""
+    captured = []
+    real_render = plugin._render_markdown_to_image
+
+    async def spy(text, render_opts=None):
+        captured.append(text)
+        return await real_render(text, render_opts)
+
+    plugin._render_markdown_to_image = spy
+    try:
+        result = await plugin.render_markdown_to_image(event, **kwargs)
+    finally:
+        plugin._render_markdown_to_image = real_render
+
+    check(
+        f"{label}: tool returned error",
+        result.get("status") == "error",
+        f"result={result}",
+    )
+    check(
+        f"{label}: error message matches",
+        str(result.get("message", "")).startswith(message_prefix),
+        f"result={result}",
+    )
+    check(f"{label}: nothing entered the render pipeline", len(captured) == 0, captured)
 
 
 async def main() -> None:
@@ -367,12 +437,63 @@ async def main() -> None:
         ev = FakeEvent("md2img", [FileComponent(name="passwd.md", file="/etc/passwd")])
         await expect_rejected(plugin, ev, "attachment escape")
 
-        # ---- 24. regression: plain text still rendered ----
+        # ---- 24. llm tool: file_path absolute (data/temp) -----------------
+        print("== llm tool: file_path absolute ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_success(
+            plugin, ev, md_content, "tool file_path absolute", file_path=note_md
+        )
+
+        # ---- 25. llm tool: file_path relative (session workspace) ---------
+        print("== llm tool: file_path relative ==")
+        ev = FakeEvent("llm tool", umo=ws_umo)
+        await expect_tool_success(
+            plugin, ev, md_content, "tool file_path relative", file_path="note.md"
+        )
+
+        # ---- 26. llm tool: admin reads /AstrBot/data/koko -----------------
+        print("== llm tool: admin reads data/koko ==")
+        ev = FakeEvent("llm tool", role="admin")
+        await expect_tool_success(
+            plugin, ev, "# forbidden", "tool admin koko", file_path=koko_file
+        )
+
+        # ---- 27. llm tool: non-admin reads data/koko rejected -------------
+        print("== llm tool: non-admin data/koko rejected ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_error(
+            plugin, ev, "tool non-admin koko", file_path=koko_file
+        )
+
+        # ---- 28. llm tool: non-admin /etc/passwd rejected -----------------
+        print("== llm tool: non-admin /etc/passwd rejected ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_error(plugin, ev, "tool non-admin /etc", file_path="/etc/passwd")
+
+        # ---- 29. llm tool regression: markdown only (no file_path) ---------
+        print("== llm tool regression: markdown only ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_success(
+            plugin, ev, "# 标题", "tool markdown only", markdown="# 标题"
+        )
+
+        # ---- 30. llm tool regression: empty markdown and no file_path -----
+        print("== llm tool regression: empty markdown ==")
+        ev = FakeEvent("llm tool")
+        await expect_tool_error(
+            plugin,
+            ev,
+            "tool empty markdown",
+            message_prefix="markdown 内容不能为空",
+            markdown="",
+        )
+
+        # ---- 31. regression: plain text still rendered ----
         print("== regression: plain text ==")
         ev = FakeEvent("md2img # 标题")
         await expect_success(plugin, ev, "# 标题", "plain text")
 
-        # ---- 25. regression: empty message prompt ----
+        # ---- 32. regression: empty message prompt ----
         print("== regression: empty message ==")
         ev = FakeEvent("md2img")
         await run_handler(plugin, ev)

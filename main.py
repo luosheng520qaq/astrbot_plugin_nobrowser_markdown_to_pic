@@ -637,16 +637,18 @@ class MyPlugin(Star):
         self,
         event: AstrMessageEvent,
         markdown: str = "",
+        file_path: str = "",
         title: str = "",
         font_size: int = 0,
         width: int = 0,
         auto_page: bool = False,
         transparent_bg: bool = False,
     ) -> dict:
-        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
+        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。如需渲染本地 Markdown/text 文件，可传 file_path（"file:绝对路径" 或 "相对路径"，如 file:/AstrBot/data/.../note.md 或 note.md；相对路径以当前会话 workspace 为根，权限与 md2img 指令一致）。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
 
         Args:
-            markdown(string): 要渲染的完整 Markdown 文本，支持标题、列表、表格、代码块、公式等语法
+            markdown(string): 要渲染的完整 Markdown 文本，支持标题、列表、表格、代码块、公式等语法；传 file_path 时忽略本参数
+            file_path(string): 可选，要读取并渲染的本地文件路径，支持 "file:绝对路径" 或 "相对路径" 形式；留空则直接渲染 markdown
             title(string): 可选，图片顶部的标题文字，留空则不显示标题
             font_size(number): 可选，正文字号，留空或 0 使用默认（默认约 25）；建议范围 8-200，越大字越大图越大
             width(number): 可选，单行内容最大宽度（像素，近似图片宽度），留空或 0 使用默认（默认约 1000）；建议范围 200-4000
@@ -654,6 +656,17 @@ class MyPlugin(Star):
             transparent_bg(boolean): 可选，是否使用透明背景、去除装饰，默认 false
         """
         md = (markdown or "").strip()
+        file_path = (file_path or "").strip()
+        if file_path:
+            # 与 md2img 指令完全一致的权限模型：workspace 根 + 管理员校验
+            try:
+                workspace_root = await self._resolve_workspace_root(event)
+                restricted = self._is_restricted_md2img_env(event)
+                md = self._read_markdown_file(
+                    file_path, workspace_root, restricted=restricted
+                )
+            except (OSError, ValueError) as e:
+                return {"status": "error", "message": f"读取文件失败: {e}"}
         if not md:
             return {"status": "error", "message": "markdown 内容不能为空。"}
         render_opts = {
