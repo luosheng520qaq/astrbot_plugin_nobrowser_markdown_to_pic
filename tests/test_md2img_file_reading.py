@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""Test script for the md2img file-reading feature.
+"""Test script for the md2img file-reading feature (readfile-aligned).
 
 Covers:
-1. `md2img file:路径` / `md2img 文件:路径` reads a local file inside the data
-   dir and sends the content into the render pipeline.
-2. A .md/.markdown/.txt file attached in the message is read and rendered.
-3. Escalation attempts are rejected: /etc/passwd, `../` escapes, symlink
-   escapes, non-allowed extensions, >2MB files, and out-of-data attachments.
-4. utf-8 first / gbk fallback decoding.
-5. Existing plain-text rendering behavior is untouched.
+1. `md2img file:路径` / `md2img 文件:路径` reads a local file inside an
+   allowed read root and sends the content into the render pipeline.
+2. Allowed read roots (aligned with AstrBot readfile): workspace (default
+   session workspace and configured workspace_path), data/skills,
+   data/plugins/*/skills, the AstrBot temp dir, and /tmp/.astrbot.
+3. Permission model (readfile-aligned): admins (role==admin) are not
+   path-restricted (koko dir and other authorized paths readable); non-admins
+   are restricted to workspace / skills / temp / /tmp/.astrbot.
+4. Forbidden roots are rejected for non-admins: /AstrBot/data/koko,
+   /AstrBot/data/plugins, /AstrBot/data (outside the allowed set), /etc, and
+   the /AstrBot root.
+5. Escalation attempts are rejected: `../` escapes, symlink escapes,
+   non-allowed extensions, >2MB files, and out-of-root attachments.
+6. Relative paths resolve against the current workspace root.
+7. utf-8 first / gbk fallback decoding.
+8. Existing plain-text rendering behavior is untouched.
 
 Run from the plugin directory:
-    python3 tests/test_md2img_file_reading.py
+    uv run python tests/test_md2img_file_reading.py
 """
 
 import asyncio
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 
 # ruff: noqa: E402, I001  # imports below must follow the env bootstrap above
@@ -50,9 +60,17 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 class FakeEvent:
     """Minimal AstrMessageEvent stub to drive the md2img handler."""
 
-    def __init__(self, message_str: str, components: list | None = None):
+    def __init__(
+        self,
+        message_str: str,
+        components: list | None = None,
+        umo: str = "test_FriendMessage_2111565284",
+        role: str = "member",
+    ):
         self.message_str = message_str
         self._components = components or []
+        self.unified_msg_origin = umo
+        self.role = role
         self.results = []  # (kind, payload), kind in {"image", "text"}
 
     def get_messages(self):
@@ -70,9 +88,10 @@ class FakeEvent:
         pass
 
 
-def make_plugin() -> MyPlugin:
+def make_plugin(config_overrides: dict | None = None) -> MyPlugin:
     config = {
         "style_path": "",
+        "workspace_path": "",
         "auto_convert_mode": "disabled",
         "md2img_len_limit": 100,
         "regex_pattern": "",
@@ -83,6 +102,8 @@ def make_plugin() -> MyPlugin:
         "intercept_mode": "disabled",
         "image_cache_ttl": 180,
     }
+    if config_overrides:
+        config.update(config_overrides)
     return MyPlugin(None, config)
 
 
@@ -145,11 +166,38 @@ async def expect_rejected(plugin: MyPlugin, event: FakeEvent, label: str):
 async def main() -> None:
     global PASS_COUNT, FAIL_COUNT
 
-    # Sandbox: a scratch dir under /AstrBot/data (inside the allowed root).
-    test_dir = os.path.join(
-        "/AstrBot", "data", "temp", f"md2img_test_{uuid.uuid4().hex[:8]}"
+    suffix = uuid.uuid4().hex[:8]
+
+    # Scratch areas, one per allowed read root.
+    test_dir = os.path.join("/AstrBot", "data", "temp", f"md2img_test_{suffix}")
+    skills_dir = os.path.join("/AstrBot", "data", "skills", f"md2img_test_{suffix}")
+    plugin_skills_dir = os.path.join(
+        "/AstrBot", "data", "plugins", f"md2img_test_{suffix}", "skills"
     )
-    os.makedirs(test_dir, exist_ok=True)
+    ws_umo = f"test_FriendMessage_md2img_{suffix}"
+    ws_dir = os.path.join("/AstrBot", "data", "workspaces", ws_umo)
+    cfg_ws_dir = os.path.join(
+        "/AstrBot", "data", "workspaces", f"md2img_test_cfg_{suffix}"
+    )
+    system_tmp_dir = os.path.join(tempfile.gettempdir(), ".astrbot")
+
+    # Forbidden scratch files inside disallowed roots (real files, so rejection
+    # is proven to come from the permission model, not FileNotFoundError).
+    koko_file = os.path.join("/AstrBot", "data", "koko", f"md2img_test_{suffix}.md")
+    plugins_root_file = os.path.join(
+        "/AstrBot", "data", "plugins", f"md2img_test_{suffix}.md"
+    )
+    data_root_file = os.path.join("/AstrBot", "data", f"md2img_test_{suffix}.md")
+
+    for d in (
+        test_dir,
+        skills_dir,
+        plugin_skills_dir,
+        ws_dir,
+        cfg_ws_dir,
+        system_tmp_dir,
+    ):
+        os.makedirs(d, exist_ok=True)
 
     md_content = (
         "# 测试文件\n\n- 列表项一\n- 列表项二\n\n```python\nprint('hello')\n```"
@@ -172,18 +220,34 @@ async def main() -> None:
     with open(big_file, "wb") as f:
         f.write(b"# big\n" + b"x" * (2 * 1024 * 1024))
 
-    # Non-allowed extension inside the data dir
+    # Non-allowed extension inside an allowed root
     exe_file = os.path.join(test_dir, "evil.exe")
     with open(exe_file, "w", encoding="utf-8") as f:
         f.write("# not allowed")
 
-    # Symlink escape: data-internal .md pointing to /etc/passwd
+    # Symlink escape: allowed-root .md pointing to /etc/passwd
     link_file = os.path.join(test_dir, "link.md")
     os.symlink("/etc/passwd", link_file)
 
+    # Same content in every allowed root (workspace / skills / plugins skills /
+    # system tmp) to prove each root is readable.
+    skills_note = os.path.join(skills_dir, "note.md")
+    plugin_skills_note = os.path.join(plugin_skills_dir, "note.md")
+    ws_note = os.path.join(ws_dir, "note.md")
+    cfg_ws_note = os.path.join(cfg_ws_dir, "note.md")
+    system_tmp_note = os.path.join(system_tmp_dir, f"md2img_test_{suffix}.md")
+    for p in (skills_note, plugin_skills_note, ws_note, cfg_ws_note, system_tmp_note):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+    for p in (koko_file, plugins_root_file, data_root_file):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("# forbidden")
+
     plugin = make_plugin()
+    plugin_cfg = make_plugin({"workspace_path": cfg_ws_dir})
     try:
-        # ---- 1. file:路径 absolute ----
+        # ---- 1. file: absolute path (data/temp) ----
         print("== file: absolute path ==")
         ev = FakeEvent(f"md2img file:{note_md}")
         await expect_success(plugin, ev, md_content, "file: absolute")
@@ -193,11 +257,10 @@ async def main() -> None:
         ev = FakeEvent(f"md2img 文件:{note_md}")
         await expect_success(plugin, ev, md_content, "文件: alias")
 
-        # ---- 3. relative path (resolved against the data dir) ----
-        print("== file: relative path ==")
-        rel = os.path.relpath(note_md, "/AstrBot/data")
-        ev = FakeEvent(f"md2img file:{rel}")
-        await expect_success(plugin, ev, md_content, "file: relative")
+        # ---- 3. relative path resolves against the session workspace ----
+        print("== file: relative path in session workspace ==")
+        ev = FakeEvent("md2img file:note.md", umo=ws_umo)
+        await expect_success(plugin, ev, md_content, "workspace relative")
 
         # ---- 4. file: path with surrounding spaces/quotes ----
         print("== file: quoted path ==")
@@ -219,42 +282,97 @@ async def main() -> None:
         ev = FakeEvent(f"md2img file:{note_gbk}")
         await expect_success(plugin, ev, "GBK编码的中文内容", "gbk fallback")
 
-        # ---- 8. security: /etc/passwd ----
+        # ---- 8. allowed root: data/skills ----
+        print("== allowed root: data/skills ==")
+        ev = FakeEvent(f"md2img file:{skills_note}")
+        await expect_success(plugin, ev, md_content, "data/skills readable")
+
+        # ---- 9. allowed root: data/plugins/*/skills ----
+        print("== allowed root: data/plugins/*/skills ==")
+        ev = FakeEvent(f"md2img file:{plugin_skills_note}")
+        await expect_success(plugin, ev, md_content, "plugin skills readable")
+
+        # ---- 10. allowed root: configured workspace_path ----
+        print("== allowed root: configured workspace_path ==")
+        ev = FakeEvent(f"md2img file:{cfg_ws_note}")
+        await expect_success(plugin_cfg, ev, md_content, "configured workspace")
+
+        # ---- 11. allowed root: /tmp/.astrbot ----
+        print("== allowed root: /tmp/.astrbot ==")
+        ev = FakeEvent(f"md2img file:{system_tmp_note}")
+        await expect_success(plugin, ev, md_content, "system tmp readable")
+
+        # ---- 12. security: /etc/passwd ----
         print("== security: /etc/passwd ==")
         ev = FakeEvent("md2img file:/etc/passwd")
         await expect_rejected(plugin, ev, "file:/etc/passwd")
 
-        # ---- 9. security: ../ escape from the data dir ----
+        # ---- 13. security: /AstrBot root ----
+        print("== security: /AstrBot root ==")
+        ev = FakeEvent("md2img file:/AstrBot/README.md")
+        await expect_rejected(plugin, ev, "/AstrBot root")
+
+        # ---- 14. security (non-admin): /AstrBot/data/koko ----------------
+        print("== security (non-admin): /AstrBot/data/koko ==")
+        ev = FakeEvent(f"md2img file:{koko_file}")
+        await expect_rejected(plugin, ev, "non-admin data/koko")
+
+        # ---- 15. admin: /AstrBot/data/koko readable -----------------------
+        print("== admin: /AstrBot/data/koko readable ==")
+        ev = FakeEvent(f"md2img file:{koko_file}", role="admin")
+        await expect_success(plugin, ev, "# forbidden", "admin koko readable")
+
+        # ---- 16. admin: unrestricted (data root, outside allowed_dirs) ----
+        print("== admin: unrestricted path outside allowed_dirs ==")
+        ev = FakeEvent(f"md2img file:{data_root_file}", role="admin")
+        await expect_success(plugin, ev, "# forbidden", "admin unrestricted")
+
+        # ---- 17. admin: extension limit still enforced --------------------
+        print("== admin: extension limit still enforced ==")
+        ev = FakeEvent(f"md2img file:{exe_file}", role="admin")
+        await expect_rejected(plugin, ev, "admin .exe rejected")
+
+        # ---- 17. security: /AstrBot/data/plugins root --------------------
+        print("== security: /AstrBot/data/plugins root ==")
+        ev = FakeEvent(f"md2img file:{plugins_root_file}")
+        await expect_rejected(plugin, ev, "data/plugins root")
+
+        # ---- 18. security: /AstrBot/data root (not in the allowed set) ----
+        print("== security: /AstrBot/data root ==")
+        ev = FakeEvent(f"md2img file:{data_root_file}")
+        await expect_rejected(plugin, ev, "data root")
+
+        # ---- 19. security: ../ escape from the workspace ----
         print("== security: ../ escape ==")
-        ev = FakeEvent("md2img file:../../../../etc/passwd")
+        ev = FakeEvent("md2img file:../../../../etc/passwd", umo=ws_umo)
         await expect_rejected(plugin, ev, "../ escape")
 
-        # ---- 10. security: symlink escape ----
+        # ---- 20. security: symlink escape ----
         print("== security: symlink escape ==")
         ev = FakeEvent(f"md2img file:{link_file}")
         await expect_rejected(plugin, ev, "symlink escape")
 
-        # ---- 11. security: non-allowed extension ----
+        # ---- 21. security: non-allowed extension ----
         print("== security: non-allowed extension ==")
         ev = FakeEvent(f"md2img file:{exe_file}")
         await expect_rejected(plugin, ev, ".exe rejected")
 
-        # ---- 12. security: file over 2MB ----
+        # ---- 22. security: file over 2MB ----
         print("== security: >2MB file ==")
         ev = FakeEvent(f"md2img file:{big_file}")
         await expect_rejected(plugin, ev, ">2MB rejected")
 
-        # ---- 13. security: attachment disguised as .md pointing outside ----
-        print("== security: attachment escaping data dir ==")
+        # ---- 23. security: attachment disguised as .md pointing outside ----
+        print("== security: attachment escaping allowed roots ==")
         ev = FakeEvent("md2img", [FileComponent(name="passwd.md", file="/etc/passwd")])
         await expect_rejected(plugin, ev, "attachment escape")
 
-        # ---- 14. regression: plain text still rendered ----
+        # ---- 24. regression: plain text still rendered ----
         print("== regression: plain text ==")
         ev = FakeEvent("md2img # 标题")
         await expect_success(plugin, ev, "# 标题", "plain text")
 
-        # ---- 15. regression: empty message prompt ----
+        # ---- 25. regression: empty message prompt ----
         print("== regression: empty message ==")
         ev = FakeEvent("md2img")
         await run_handler(plugin, ev)
@@ -267,6 +385,15 @@ async def main() -> None:
 
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
+        shutil.rmtree(skills_dir, ignore_errors=True)
+        shutil.rmtree(os.path.dirname(plugin_skills_dir), ignore_errors=True)
+        shutil.rmtree(ws_dir, ignore_errors=True)
+        shutil.rmtree(cfg_ws_dir, ignore_errors=True)
+        for p in (koko_file, plugins_root_file, data_root_file, system_tmp_note):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     print(f"\n=== {PASS_COUNT} passed, {FAIL_COUNT} failed ===")
     sys.exit(1 if FAIL_COUNT else 0)
