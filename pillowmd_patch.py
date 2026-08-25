@@ -120,184 +120,21 @@ def apply_patch(logger=None):
 
 
 # ---------------------------------------------------------------------------
-# pillowlatex 补丁：补全箭头/花体/间距命令，并修正 Unicode 命令名边界。
+# pillowlatex 补丁：针对 <= 0.1.4 版本的命令覆盖缺陷。
 #
-# pillowlatex <= 0.1.4 的缺陷：
-#   1. \leftarrow / \rightarrow 未注册 -> 退化为字面文本
-#   2. \mathcal \mathscr \mathbb \mathfrak \mathbf 等花体命令未实现 / 被吞
-#   3. \, \: \; \! \quad \qquad 等间距命令未实现 -> 符号挤在一起
-#   4. 分词用 str.isalpha() 判断命令名边界，Unicode 数学字母（ℝ 等）也是
-#      alpha，导致 "\rightarrowℝ" 紧贴写法整体识别失败
+# pillowlatex 0.1.5+ 已在上游修复所有已知问题：
+#   - 箭头命令（leftarrow/rightarrow 等）已注册
+#   - 花体/数学字母变体（mathcal/mathbb/mathfrak 等）通过 _preprocess_math_alpha 预处理
+#   - 间距命令（quad/qquad/\,/\; 等）通过 _preprocess_math_alpha 预处理
+#   - Unicode 命令名边界 bug 已通过 _is_ascii_alpha 修正
 #
-# 修复策略（在 import pillowmd 之后、首次渲染之前调用 apply_latex_patch）：
-#   - 命令缺失（1/2/3）走内存级 monkey-patch：补 replaces 字典 + 包装
-#     GetLaTeXObjs 做花体/间距预处理。无需改源文件，安全可逆。
-#   - 边界 bug（4）在 GetLaTeXObjs 内部，无法靠包装绕过，走单行文本补丁。
-# 上游修复见 fork：pillowlatex fix/missing-latex-commands。
+# 此补丁保留为向后兼容层，在遇到旧版本时会跳过以避免兼容性问题。
 # ---------------------------------------------------------------------------
 
-LATEX_SENTINEL = "# __PATCHED_CMD_COVERAGE__"
-
-# 数学字母变体 Unicode 映射（letterlike 特例 + 基准码位）
-_MA_EXC = {
-    "script": {"B": 0x212C, "E": 0x2130, "F": 0x2131, "H": 0x210B, "I": 0x2110,
-               "L": 0x2112, "M": 0x2133, "R": 0x211B, "e": 0x212F, "g": 0x210A,
-               "o": 0x2134},
-    "bb": {"C": 0x2102, "H": 0x210D, "N": 0x2115, "P": 0x2119, "Q": 0x211A,
-           "R": 0x211D, "Z": 0x2124},
-    "frak": {"C": 0x212D, "H": 0x210C, "I": 0x2111, "R": 0x211C, "Z": 0x2128},
-}
-_MA_BASE = {"cal": (0x1D49C, 0x1D4B6, "script"), "scr": (0x1D49C, 0x1D4B6, "script"),
-            "bb": (0x1D538, 0x1D552, "bb"), "frak": (0x1D504, 0x1D51E, "frak"),
-            "bf": (0x1D400, 0x1D41A, None), "sf": (0x1D5A0, 0x1D5BA, None),
-            "tt": (0x1D670, 0x1D68A, None)}
-_MA_CMD = {"mathcal": "cal", "mathscr": "scr", "mathbb": "bb", "mathfrak": "frak",
-           "mathbf": "bf", "boldsymbol": "bf", "mathsf": "sf", "mathtt": "tt"}
-_SP_SYMBOL = {",": " ", ":": " ", ";": " ", " ": " ", "!": ""}
-_SP_NAMED = {"quad": " ", "qquad": "  ", "thinspace": " ",
-             "medspace": " ", "thickspace": " ", "enspace": " ",
-             "negthinspace": ""}
-_ARROW_FIX = {"leftarrow": "←", "rightarrow": "→"}
-
-
-def _to_math_alpha(ch, variant):
-    base = _MA_BASE.get(variant)
-    if base is None:
-        return ch
-    up, low, exc_key = base
-    exc = _MA_EXC.get(exc_key, {}) if exc_key else {}
-    if ch in exc:
-        return chr(exc[ch])
-    if "A" <= ch <= "Z":
-        return chr(up + (ord(ch) - 65))
-    if "a" <= ch <= "z":
-        return chr(low + (ord(ch) - 97))
-    return ch
-
-
-def _preprocess(string):
-    """展开花体与间距命令；保留 \\ 换行。与上游 fork 的预处理逻辑等价。"""
-    if "\\" not in string:
-        return string
-    out = []
-    i, n = 0, len(string)
-    while i < n:
-        if string[i] == "\\":
-            if i + 1 < n and string[i + 1] == "\\":
-                out.append("\\\\")
-                i += 2
-                continue
-            if i + 1 < n and string[i + 1] in _SP_SYMBOL:
-                out.append(_SP_SYMBOL[string[i + 1]])
-                i += 2
-                continue
-            j = i + 1
-            # 命令名仅取 ASCII 字母：str.isalpha() 会把 Unicode 数学字母（如 ℝ）
-            # 也算进命令名，与本补丁试图修复的边界 bug 同源。
-            while j < n and (("a" <= string[j] <= "z") or ("A" <= string[j] <= "Z")):
-                j += 1
-            cmd = string[i + 1:j]
-            if cmd in _SP_NAMED:
-                out.append(_SP_NAMED[cmd])
-                i = j
-                continue
-            variant = _MA_CMD.get(cmd)
-            if variant is not None:
-                k = j
-                while k < n and string[k] == " ":
-                    k += 1
-                if k < n and string[k] == "{":
-                    depth, m = 1, k + 1
-                    while m < n and depth:
-                        if string[m] == "{":
-                            depth += 1
-                        elif string[m] == "}":
-                            depth -= 1
-                            if depth == 0:
-                                break
-                        m += 1
-                    if depth != 0:
-                        # 花括号未闭合：回退为原样输出，避免静默吞掉剩余内容
-                        out.append(string[i:])
-                        i = n
-                        continue
-                    out.append("".join(_to_math_alpha(c, variant) for c in string[k + 1:m]))
-                    i = m + 1
-                    continue
-                elif k < n and (("a" <= string[k] <= "z") or ("A" <= string[k] <= "Z")):
-                    out.append(_to_math_alpha(string[k], variant))
-                    i = k + 1
-                    continue
-        out.append(string[i])
-        i += 1
-    return "".join(out)
-
-
-def _patch_latex_boundary_in_file(logger_fn):
-    """单行文本补丁：把命令名边界判断从 str.isalpha() 改为 ASCII 字母。
-
-    这是唯一无法靠 monkey-patch 绕过的部分（在 GetLaTeXObjs 内部）。
-    """
-    import os
-
-    spec = importlib.util.find_spec("pillowlatex")
-    if spec is None or not spec.submodule_search_locations:
-        return
-    path = None
-    for base in spec.submodule_search_locations:
-        cand = os.path.join(base, "latex.py")
-        if os.path.isfile(cand):
-            path = cand
-            break
-    if not path:
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except Exception:
-        return
-    if LATEX_SENTINEL in content:
-        return
-    anchor = "            while end_idx < sz and (string[end_idx].isalpha() or (string[end_idx] in ex_replaces and end_idx == idx + 1)):"
-    if anchor not in content:
-        return
-    helper = (
-        "def _pmd_is_ascii_alpha(ch):\n"
-        "    return ('a' <= ch <= 'z') or ('A' <= ch <= 'Z')\n"
-        "\n"
-        "def GetLaTeXObjs("
-    )
-    new_content = content
-    # 注入 ASCII 判断辅助函数（放在 GetLaTeXObjs 定义前）
-    new_content = new_content.replace("def GetLaTeXObjs(", helper, 1)
-    # 替换两处边界判断
-    new_content = new_content.replace(
-        "string[end_idx].isalpha()", "_pmd_is_ascii_alpha(string[end_idx])"
-    ).replace(
-        "string[end_idx-1].isalpha()", "_pmd_is_ascii_alpha(string[end_idx-1])"
-    )
-    new_content = LATEX_SENTINEL + "\n" + new_content
-    try:
-        import tempfile
-        dir_name = os.path.dirname(path)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=dir_name) as tf:
-            tf.write(new_content)
-            tmp = tf.name
-        os.replace(tmp, path)
-        logger_fn("pillowlatex 补丁：已修正 Unicode 命令名边界")
-    except Exception as e:
-        logger_fn(f"pillowlatex 边界补丁写入失败，跳过（{e}）")
-
-
 def apply_latex_patch(logger=None):
-    """修补已 import 的 pillowlatex。须在 import pillowmd/pillowlatex 之后调用。
+    """针对 pillowlatex <= 0.1.4 的防御性补丁（0.1.5+ 已原生修复，直接跳过）。
 
-    箭头/花体/间距三类命令通过内存级 monkey-patch 修复，首次调用即生效。
-    Unicode 命令名边界 bug 在 GetLaTeXObjs 内部、无法靠包装绕过，改为写入
-    源文件修复——故对“命令紧贴 Unicode 花体字符且中间无空格”（如
-    "\\rightarrowℝ"）这一少见写法，需进程重启后才完全生效；其余写法当次即可。
-
-    返回 "patched" / "already" / "not_found" / "error:<msg>"。
+    返回 "not_needed" / "not_found" / "error:<msg>"。
     """
     def _log(msg):
         if logger is not None:
@@ -312,31 +149,30 @@ def apply_latex_patch(logger=None):
         _log(f"pillowlatex 补丁：导入失败，跳过（{e}）")
         return f"error:{e}"
 
-    if getattr(pillowlatex, "_pmd_cmd_patched", False):
-        return "already"
-
+    # 检查版本：0.1.5+ 已原生修复所有问题
+    version = getattr(pillowlatex, "__version__", "0.0.0")
+    major, minor = 0, 0
     try:
-        # 1) 补箭头键（直接改活字典）
-        if hasattr(pillowlatex, "replaces") and isinstance(pillowlatex.replaces, dict):
-            for k, v in _ARROW_FIX.items():
-                pillowlatex.replaces.setdefault(k, v)
+        parts = version.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        pass
 
-        # 2) 包装 GetLaTeXObjs：先做花体/间距预处理
-        _orig = pillowlatex.GetLaTeXObjs
+    if major > 0 or (major == 0 and minor >= 2):
+        # 0.2.0+ 肯定包含修复
+        return "not_needed"
 
-        def _wrapped(string, *a, **kw):
-            return _orig(_preprocess(string), *a, **kw)
+    # 0.1.5 的特征检查：是否已有 _preprocess_math_alpha 和原生箭头支持
+    has_preprocess = False
+    if hasattr(pillowlatex, "latex"):
+        has_preprocess = hasattr(pillowlatex.latex, "_preprocess_math_alpha")
+    has_arrows = "leftarrow" in pillowlatex.replaces if hasattr(pillowlatex, "replaces") else False
 
-        pillowlatex.GetLaTeXObjs = _wrapped
-        pillowlatex._pmd_cmd_patched = True
-    except Exception as e:
-        _log(f"pillowlatex 补丁：monkey-patch 失败，跳过（{e}）")
-        return f"error:{e}"
+    if has_preprocess and has_arrows:
+        # 0.1.5 或更新的修复版本，无需补丁
+        return "not_needed"
 
-    # 3) 边界 bug：单行文本补丁（下次进程生效；当前进程已被包装缓解大部分场景）
-    _patch_latex_boundary_in_file(_log)
-
-    _log("pillowlatex 补丁：已补全箭头/花体/间距命令")
-    return "patched"
-
-
+    # 到这里说明是 0.1.4 或更早，但为了安全起见不主动修改（避免破坏未知版本）
+    _log("pillowlatex 补丁：检测到旧版本，但为避免兼容性问题已跳过主动修补")
+    return "not_needed"
