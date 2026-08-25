@@ -530,6 +530,8 @@ async def main() -> None:
         )
 
     finally:
+        await plugin.terminate()
+        await plugin_cfg.terminate()
         shutil.rmtree(test_dir, ignore_errors=True)
         shutil.rmtree(skills_dir, ignore_errors=True)
         shutil.rmtree(os.path.dirname(plugin_skills_dir), ignore_errors=True)
