@@ -679,7 +679,7 @@ class MyPlugin(Star):
         auto_page: bool = False,
         transparent_bg: bool = False,
     ) -> dict:
-        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。如需渲染本地 Markdown/text 文件，可传 file_path（"file:绝对路径" 或 "相对路径"，如 file:/AstrBot/data/.../note.md 或 note.md；相对路径以当前会话 workspace 为根，权限与 md2img 指令一致）。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
+        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。如需渲染本地 Markdown/text 文件，优先传入 file_path（"file:绝对路径" 或 "相对路径"，如 file:/AstrBot/data/.../note.md 或 note.md；相对路径以当前会话 workspace 为根）而非markdown。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
 
         Args:
             markdown(string): 要渲染的完整 Markdown 文本，支持标题、列表、表格、代码块、公式等语法；传 file_path 时忽略本参数
