@@ -3,12 +3,14 @@ import re
 import asyncio
 import tempfile
 import dataclasses
+from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import LLMResponse
 from astrbot.api.message_components import Plain
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import astrbot.core.message.components as Comp
 
 # 必须在 import pillowmd 之前打补丁，使首次运行即生效、无需重启
@@ -21,6 +23,13 @@ import pillowmd
 
 # pillowlatex 命令补全须在 import 之后（依赖其活模块对象做 monkey-patch）
 _apply_pillowlatex_patch(logger)
+
+
+# md2img 文件读取功能的限制：仅允许 data 目录内的 .md/.markdown/.txt 文件，单文件不超过 2MB
+_MD2IMG_ALLOWED_EXTS = (".md", ".markdown", ".txt")
+_MD2IMG_MAX_FILE_SIZE = 2 * 1024 * 1024
+# 匹配 md2img file:路径 / md2img 文件:路径 语法，兼容中英文冒号与首尾空白/引号
+_MD2IMG_FILE_ARG_RE = re.compile(r"^\s*(?:file|文件)\s*[:：]\s*(.+?)\s*$")
 
 
 @register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.7.0")
@@ -392,12 +401,94 @@ class MyPlugin(Star):
                 self._last_image_paths.extend(temp_paths)
             result.chain = new_chain
 
+    def _read_markdown_file(self, file_path: str) -> str:
+        """Read a Markdown/text file inside the AstrBot data dir with security checks.
+
+        Relative paths are resolved against the AstrBot data dir. The resolved
+        path must stay inside the data dir (realpath normalization blocks
+        ``../`` escapes and symlink escapes), the extension must be one of
+        .md/.markdown/.txt, and the file size must not exceed 2MB. Content is
+        decoded with utf-8 first, then gbk as a fallback.
+
+        Args:
+            file_path: File path, absolute or relative to the data dir.
+
+        Returns:
+            File content as text.
+
+        Raises:
+            FileNotFoundError: The file does not exist.
+            ValueError: Path escapes the data dir, extension is not allowed,
+                file is too large, or content cannot be decoded.
+            OSError: The file cannot be read.
+        """
+        data_root = Path(get_astrbot_data_path()).resolve()
+        raw_path = Path(file_path)
+        if not raw_path.is_absolute():
+            raw_path = data_root / raw_path
+        resolved = raw_path.resolve()
+
+        # Security: realpath-normalized path must stay inside the data dir.
+        if not resolved.is_relative_to(data_root):
+            raise ValueError(f"Forbidden: path is outside the data dir: {file_path}")
+        if resolved.suffix.lower() not in _MD2IMG_ALLOWED_EXTS:
+            raise ValueError(f"Only .md/.markdown/.txt files are allowed: {file_path}")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"File does not exist: {file_path}")
+        if resolved.stat().st_size > _MD2IMG_MAX_FILE_SIZE:
+            raise ValueError(f"File exceeds the 2MB limit: {file_path}")
+
+        try:
+            return resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # gbk fallback for legacy Chinese-encoded text files
+            return resolved.read_text(encoding="gbk")
+
     @filter.command("md2img", priority=-999)
     async def markdown_to_image(self, event: AstrMessageEvent):
         """Markdown转图片指令"""
         message_str = event.message_str
         pattern = r'^' + re.escape('md2img')
         message_str = re.sub(pattern, '', message_str).strip()
+
+        # 1) file:路径 / 文件:路径 语法：读取 data 目录内的本地文件
+        file_arg_match = _MD2IMG_FILE_ARG_RE.match(message_str)
+        if file_arg_match:
+            file_path = file_arg_match.group(1).strip().strip('"\'')
+            try:
+                content = self._read_markdown_file(file_path)
+            except (OSError, ValueError) as e:
+                yield event.plain_result(f"读取文件失败: {e}")
+                return
+            async for result in self._generate_and_send_image(content, event, False):
+                yield result
+            return
+
+        # 2) 消息附带 .md/.markdown/.txt 文件
+        file_comp = None
+        for comp in event.get_messages():
+            if not isinstance(comp, Comp.File):
+                continue
+            comp_name = (comp.name or "").lower()
+            comp_path = Path(comp.file_ or "").suffix.lower() if comp.file_ else ""
+            if comp_name.endswith(_MD2IMG_ALLOWED_EXTS) or comp_path in _MD2IMG_ALLOWED_EXTS:
+                file_comp = comp
+                break
+
+        if file_comp is not None:
+            try:
+                file_path = await file_comp.get_file()
+                if not file_path:
+                    raise ValueError("cannot get file content")
+                content = self._read_markdown_file(file_path)
+            except (OSError, ValueError) as e:
+                yield event.plain_result(f"读取文件失败: {e}")
+                return
+            async for result in self._generate_and_send_image(content, event, False):
+                yield result
+            return
+
+        # 3) 原有行为：直接渲染消息文本
         if not message_str:
             yield event.plain_result("请输入要转换的Markdown内容")
             return
