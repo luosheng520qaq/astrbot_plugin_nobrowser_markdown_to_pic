@@ -5,6 +5,12 @@
         "hint": "例如 C:\\styles\\my-style 或 /data/styles/default",
         "default": ""
     },
+    "workspace_path": {
+        "description": "md2img 文件读取的 workspace 根目录；留空则自动使用 AstrBot 当前会话/项目 workspace。相对路径解析以此为根。",
+        "type": "string",
+        "hint": "例如 /AstrBot/data/workspaces/test_FriendMessage_2111565284；相对路径以 data/workspaces 为根",
+        "default": ""
+    },
     "auto_convert_mode": {
         "description": "自动转图模式",
         "type": "string",

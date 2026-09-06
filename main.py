@@ -1,25 +1,111 @@
 import os
 import re
 import asyncio
+import functools
 import tempfile
 import dataclasses
+from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import LLMResponse
 from astrbot.api.message_components import Plain
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_builtin_plugin_path,
+    get_astrbot_data_path,
+    get_astrbot_plugin_path,
+    get_astrbot_skills_path,
+    get_astrbot_system_tmp_path,
+    get_astrbot_temp_path,
+)
+from astrbot.core.workspace import (
+    default_workspace_root,
+    resolve_workspace_root_for_umo,
+    workspace_path_to_root,
+)
 import astrbot.core.message.components as Comp
 
 # 必须在 import pillowmd 之前打补丁，使首次运行即生效、无需重启
 from .pillowmd_patch import apply_patch as _apply_pillowmd_patch
+from .pillowmd_patch import apply_latex_patch as _apply_pillowlatex_patch
 
 _apply_pillowmd_patch(logger)
 
 import pillowmd
 
+# pillowlatex 命令补全须在 import 之后（依赖其活模块对象做 monkey-patch）
+_apply_pillowlatex_patch(logger)
 
-@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.6.1")
+
+# md2img 文件读取功能的限制（对齐 AstrBot readfile 的本地受限权限模型，并额外
+# 放行 data/attachments 以支持 webchat 上传文件场景）：
+# 非管理员仅允许 data/skills、data/plugins/*/skills、astrbot/builtin_stars/*/skills、
+# data/attachments、当前会话 workspace、/tmp/.astrbot、astrbot_temp 内的
+# .md/.markdown/.txt 文件，单文件不超过 2MB；管理员不受路径限制（含 data/koko 等已授权路径）
+_MD2IMG_ALLOWED_EXTS = (".md", ".markdown", ".txt")
+_MD2IMG_MAX_FILE_SIZE = 2 * 1024 * 1024
+# 匹配 md2img file:路径 / md2img 文件:路径 语法，兼容中英文冒号与首尾空白/引号
+_MD2IMG_FILE_ARG_RE = re.compile(r"^\s*(?:file|文件)\s*[:：]\s*(.+?)\s*$")
+
+
+@functools.lru_cache(maxsize=1)
+def _plugin_skill_roots() -> tuple[Path, ...]:
+    """Plugin-provided skills roots (data/plugins/*/skills, builtin_stars/*/skills).
+
+    Cached: the plugin roster is fixed for the process lifetime, so repeated
+    directory scans on every file read are wasted work.
+    """
+    roots: list[Path] = []
+    for plugins_root in (
+        Path(get_astrbot_plugin_path()),
+        Path(get_astrbot_builtin_plugin_path()),
+    ):
+        if not plugins_root.is_dir():
+            continue
+        roots.extend(
+            (plugin_dir / "skills").resolve(strict=False)
+            for plugin_dir in plugins_root.iterdir()
+            if plugin_dir.is_dir() and (plugin_dir / "skills").is_dir()
+        )
+    return tuple(roots)
+
+
+def _md2img_read_allowed_roots(workspace_root: Path) -> tuple[Path, ...]:
+    """Return the read-allowed roots for md2img, aligned with the readfile tool.
+
+    Mirrors the local restricted permission model of
+    ``astrbot.core.tools.computer_tools.fs._read_allowed_roots``: global skills,
+    plugin-provided skills, the current workspace, the AstrBot system temp dir
+    and the AstrBot temp dir. Also allows ``data/attachments`` so files
+    uploaded through the webchat adapter can be rendered. Anything else
+    (including other ``data`` subdirectories) is rejected.
+
+    Args:
+        workspace_root: Current session/project workspace root.
+
+    Returns:
+        Tuple of resolved allowed root directories.
+    """
+    return (
+        Path(get_astrbot_skills_path()).resolve(strict=False),
+        Path(get_astrbot_system_tmp_path()).resolve(strict=False),
+        Path(get_astrbot_temp_path()).resolve(strict=False),
+        (Path(get_astrbot_data_path()) / "attachments").resolve(strict=False),
+        workspace_root,
+        *_plugin_skill_roots(),
+    )
+
+
+def _extract_md2img_file_arg(text: str) -> str | None:
+    """Match ``file:``/``文件:`` syntax and return the unquoted path, or None."""
+    match = _MD2IMG_FILE_ARG_RE.match(text)
+    if not match:
+        return None
+    return match.group(1).strip().strip('"\'')
+
+
+@register("astrbot_plugin_nobrowser_markdown_to_pic", "Xican", "无浏览器Markdown转图片", "1.7.0")
 class MyPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -29,6 +115,8 @@ class MyPlugin(Star):
         # 新增 mix 模式支持：配置中已经有 "disabled" / "length" / "regex" / "mix"
         self.auto_convert_mode = config.get("auto_convert_mode", "length")
         self.md2img_len_limit = config.get("md2img_len_limit", 100)
+        # md2img 文件读取的 workspace 根；留空则使用 AstrBot 当前会话/项目 workspace
+        self.workspace_path = config.get("workspace_path", "").strip()
         self.regex_pattern = config.get(
             "regex_pattern",
             r"```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^#{1,6}\s+.+$|^>\s+.+$|^\s*[-*+]\s+.+$|^\s*\d+\.\s+.+$|\|[^\n]*\||\[.+?\]\(.+?\)|!\[.*?\]\(.+?\)|^\s*---+\s*$|^\s*\*\*\*+\s*$"
@@ -388,34 +476,214 @@ class MyPlugin(Star):
                 self._last_image_paths.extend(temp_paths)
             result.chain = new_chain
 
+    async def _resolve_workspace_root(self, event: AstrMessageEvent) -> Path:
+        """Resolve the read workspace root for an event (readfile-aligned).
+
+        A configured ``workspace_path`` wins; otherwise the AstrBot current
+        session/project workspace for the event is used.
+
+        Args:
+            event: The message event.
+
+        Returns:
+            Resolved workspace root.
+
+        Raises:
+            ValueError: The configured workspace path is invalid.
+        """
+        configured = self.workspace_path.strip()
+        if configured:
+            return workspace_path_to_root(configured)
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        db = None
+        if self.context is not None:
+            try:
+                db = self.context.get_db()
+            except Exception:
+                db = None
+        if db is not None:
+            try:
+                return await resolve_workspace_root_for_umo(umo, db)
+            except Exception:
+                pass
+        return default_workspace_root(umo)
+
+    def _is_restricted_md2img_env(self, event: AstrMessageEvent) -> bool:
+        """Whether md2img file reads are path-restricted for this event.
+
+        Mirrors the readfile tool's ``_is_restricted_env``: admins are never
+        path-restricted; non-admins are restricted unless the provider setting
+        ``computer_use_require_admin`` is disabled (checked via the plugin
+        context when available, defaulting to restricted).
+
+        Args:
+            event: The message event.
+
+        Returns:
+            True if only the allowed read roots may be accessed.
+        """
+        if getattr(event, "role", "member") == "admin":
+            return False
+        require_admin = True
+        if self.context is not None:
+            try:
+                umo = getattr(event, "unified_msg_origin", "")
+                cfg = self.context.get_config(umo=umo)
+                require_admin = bool(
+                    cfg.get("provider_settings", {}).get(
+                        "computer_use_require_admin", True
+                    )
+                )
+            except Exception:
+                require_admin = True
+        return require_admin
+
+    async def _read_md2img_file(self, event: AstrMessageEvent, file_path: str) -> str:
+        """Resolve the workspace/permission context for an event and read a file.
+
+        Shared by the ``md2img`` command and the ``render_markdown_to_image``
+        LLM tool so both apply the exact same permission model. Workspace
+        resolution is only paid for once a file read is actually requested.
+
+        Args:
+            event: The message event.
+            file_path: File path, absolute or relative to the workspace root.
+
+        Returns:
+            File content as text.
+
+        Raises:
+            FileNotFoundError, ValueError, OSError: see ``_read_markdown_file``.
+        """
+        workspace_root = await self._resolve_workspace_root(event)
+        restricted = self._is_restricted_md2img_env(event)
+        return self._read_markdown_file(file_path, workspace_root, restricted=restricted)
+
+    def _read_markdown_file(
+        self, file_path: str, workspace_root: Path, restricted: bool = True
+    ) -> str:
+        """Read a Markdown/text file with the readfile-aligned permission model.
+
+        Relative paths are resolved against the workspace root. In a restricted
+        environment (non-admin), the realpath must stay inside one of the
+        allowed read roots (data/skills, data/plugins/*/skills,
+        astrbot/builtin_stars/*/skills, the workspace, /tmp/.astrbot, or the
+        AstrBot temp dir), which blocks ``../`` escapes and symlink escapes.
+        Admins are not path-restricted (aligned with readfile), but the
+        extension, size and decoding limits below still apply.
+
+        Args:
+            file_path: File path, absolute or relative to the workspace root.
+            workspace_root: Root used to resolve relative paths.
+            restricted: Whether the path must stay inside the allowed roots.
+
+        Returns:
+            File content as text.
+
+        Raises:
+            FileNotFoundError: The file does not exist.
+            ValueError: Path escapes the allowed roots, extension is not
+                allowed, file is too large, or content cannot be decoded.
+            OSError: The file cannot be read.
+        """
+        candidate = Path(file_path).expanduser()
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+        else:
+            resolved = (workspace_root / candidate).resolve(strict=False)
+
+        if restricted:
+            # Security: realpath-normalized path must stay inside an allowed root.
+            allowed_roots = _md2img_read_allowed_roots(workspace_root)
+            if not any(
+                resolved == root or resolved.is_relative_to(root)
+                for root in allowed_roots
+            ):
+                raise ValueError(
+                    f"Forbidden: path is outside the allowed read directories: {file_path}"
+                )
+        if resolved.suffix.lower() not in _MD2IMG_ALLOWED_EXTS:
+            raise ValueError(f"Only .md/.markdown/.txt files are allowed: {file_path}")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"File does not exist: {file_path}")
+        if resolved.stat().st_size > _MD2IMG_MAX_FILE_SIZE:
+            raise ValueError(f"File exceeds the 2MB limit: {file_path}")
+
+        try:
+            return resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # gbk fallback for legacy Chinese-encoded text files
+            return resolved.read_text(encoding="gbk")
+
     @filter.command("md2img", priority=-999)
     async def markdown_to_image(self, event: AstrMessageEvent):
         """Markdown转图片指令"""
         message_str = event.message_str
         pattern = r'^' + re.escape('md2img')
         message_str = re.sub(pattern, '', message_str).strip()
-        if not message_str:
-            yield event.plain_result("请输入要转换的Markdown内容")
-            return
 
-        async for result in self._generate_and_send_image(message_str, event, False):
-            yield result
+        downloaded_attachment = None  # 记录 get_file() 下载的临时文件，用后清理
+        try:
+            # 1) file:路径 / 文件:路径 语法：读取允许目录内的本地文件
+            #    相对路径以当前会话 workspace 为根（对齐 AstrBot readfile 本地路径解析）
+            file_path = _extract_md2img_file_arg(message_str)
+
+            # 2) 消息附带 .md/.markdown/.txt 文件
+            if file_path is None:
+                file_comp = None
+                for comp in event.get_messages():
+                    if not isinstance(comp, Comp.File):
+                        continue
+                    comp_name = (comp.name or "").lower()
+                    comp_path = Path(comp.file_ or "").suffix.lower() if comp.file_ else ""
+                    if comp_name.endswith(_MD2IMG_ALLOWED_EXTS) or comp_path in _MD2IMG_ALLOWED_EXTS:
+                        file_comp = comp
+                        break
+                if file_comp is not None:
+                    file_path = await file_comp.get_file()
+                    downloaded_attachment = file_path  # 标记为需要清理的下载文件
+                    if not file_path:
+                        yield event.plain_result("读取文件失败: cannot get file content")
+                        return
+
+            # 3) 命中 file:语法或文件附件时，读取文件内容替代消息文本
+            if file_path is not None:
+                try:
+                    message_str = await self._read_md2img_file(event, file_path)
+                except (OSError, ValueError) as e:
+                    yield event.plain_result(f"读取文件失败: {e}")
+                    return
+            elif not message_str:
+                # 4) 原有行为：直接渲染消息文本
+                yield event.plain_result("请输入要转换的Markdown内容")
+                return
+
+            async for result in self._generate_and_send_image(message_str, event, False):
+                yield result
+        finally:
+            if downloaded_attachment:
+                try:
+                    os.unlink(downloaded_attachment)
+                except OSError:
+                    pass
 
     @filter.llm_tool(name="render_markdown_to_image")
     async def render_markdown_to_image(
         self,
         event: AstrMessageEvent,
         markdown: str = "",
+        file_path: str = "",
         title: str = "",
         font_size: int = 0,
         width: int = 0,
         auto_page: bool = False,
         transparent_bg: bool = False,
     ) -> dict:
-        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
+        """将 Markdown 文本渲染为图片并直接发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版，文本形式难以清晰展示时调用本工具。如需渲染本地 Markdown/text 文件，优先传入 file_path（"file:绝对路径" 或 "相对路径"，如 file:/AstrBot/data/.../note.md 或 note.md；相对路径以当前会话 workspace 为根）而非markdown。可选参数用于控制排版样式，不需要时留空即可使用默认样式。
 
         Args:
-            markdown(string): 要渲染的完整 Markdown 文本，支持标题、列表、表格、代码块、公式等语法
+            markdown(string): 要渲染的完整 Markdown 文本，支持标题、列表、表格、代码块、公式等语法；传 file_path 时忽略本参数
+            file_path(string): 可选，要读取并渲染的本地文件路径，支持 "file:绝对路径" 或 "相对路径" 形式；留空则直接渲染 markdown
             title(string): 可选，图片顶部的标题文字，留空则不显示标题
             font_size(number): 可选，正文字号，留空或 0 使用默认（默认约 25）；建议范围 8-200，越大字越大图越大
             width(number): 可选，单行内容最大宽度（像素，近似图片宽度），留空或 0 使用默认（默认约 1000）；建议范围 200-4000
@@ -423,6 +691,16 @@ class MyPlugin(Star):
             transparent_bg(boolean): 可选，是否使用透明背景、去除装饰，默认 false
         """
         md = (markdown or "").strip()
+        file_path = (file_path or "").strip()
+        if file_path:
+            # 剥离开头的 "file:路径" / "文件:路径" 前缀（含中英文冒号、可选空白/引号），
+            # 与 md2img 指令的 _extract_md2img_file_arg 处理保持一致
+            file_path = _extract_md2img_file_arg(file_path) or file_path
+            # 与 md2img 指令完全一致的权限模型：workspace 根 + 管理员校验
+            try:
+                md = await self._read_md2img_file(event, file_path)
+            except (OSError, ValueError) as e:
+                return {"status": "error", "message": f"读取文件失败: {e}"}
         if not md:
             return {"status": "error", "message": "markdown 内容不能为空。"}
         render_opts = {

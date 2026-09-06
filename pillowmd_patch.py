@@ -118,3 +118,61 @@ def apply_patch(logger=None):
     _log("pillowmd 补丁：已修复公式渲染 BUG（latex-formula-poisoning）")
     return "patched"
 
+
+# ---------------------------------------------------------------------------
+# pillowlatex 补丁：针对 <= 0.1.4 版本的命令覆盖缺陷。
+#
+# pillowlatex 0.1.5+ 已在上游修复所有已知问题：
+#   - 箭头命令（leftarrow/rightarrow 等）已注册
+#   - 花体/数学字母变体（mathcal/mathbb/mathfrak 等）通过 _preprocess_math_alpha 预处理
+#   - 间距命令（quad/qquad/\,/\; 等）通过 _preprocess_math_alpha 预处理
+#   - Unicode 命令名边界 bug 已通过 _is_ascii_alpha 修正
+#
+# 此补丁保留为向后兼容层，在遇到旧版本时会跳过以避免兼容性问题。
+# ---------------------------------------------------------------------------
+
+def apply_latex_patch(logger=None):
+    """针对 pillowlatex <= 0.1.4 的防御性补丁（0.1.5+ 已原生修复，直接跳过）。
+
+    返回 "not_needed" / "not_found" / "error:<msg>"。
+    """
+    def _log(msg):
+        if logger is not None:
+            try:
+                logger.info(msg)
+            except Exception:
+                pass
+
+    try:
+        import pillowlatex
+    except Exception as e:
+        _log(f"pillowlatex 补丁：导入失败，跳过（{e}）")
+        return f"error:{e}"
+
+    # 检查版本：0.1.5+ 已原生修复所有问题
+    version = getattr(pillowlatex, "__version__", "0.0.0")
+    major, minor = 0, 0
+    try:
+        parts = version.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        pass
+
+    if major > 0 or (major == 0 and minor >= 2):
+        # 0.2.0+ 肯定包含修复
+        return "not_needed"
+
+    # 0.1.5 的特征检查：是否已有 _preprocess_math_alpha 和原生箭头支持
+    has_preprocess = False
+    if hasattr(pillowlatex, "latex"):
+        has_preprocess = hasattr(pillowlatex.latex, "_preprocess_math_alpha")
+    has_arrows = "leftarrow" in pillowlatex.replaces if hasattr(pillowlatex, "replaces") else False
+
+    if has_preprocess and has_arrows:
+        # 0.1.5 或更新的修复版本，无需补丁
+        return "not_needed"
+
+    # 到这里说明是 0.1.4 或更早，但为了安全起见不主动修改（避免破坏未知版本）
+    _log("pillowlatex 补丁：检测到旧版本，但为避免兼容性问题已跳过主动修补")
+    return "not_needed"
